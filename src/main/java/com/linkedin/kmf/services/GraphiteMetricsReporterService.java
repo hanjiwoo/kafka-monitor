@@ -14,13 +14,15 @@ import static com.linkedin.kmf.common.Utils.getMBeanAttributeValues;
 
 import com.linkedin.kmf.common.MbeanAttributeValue;
 import com.linkedin.kmf.services.configs.GraphiteMetricsReporterServiceConfig;
-import net.savantly.graphite.GraphiteClient;
-import net.savantly.graphite.GraphiteClientFactory;
-import net.savantly.graphite.impl.SimpleCarbonMetric;
+import com.codahale.metrics.graphite.Graphite;
 import org.apache.commons.lang.StringUtils;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
+import java.io.IOException;
+import java.net.Inet4Address;
+import java.net.InetAddress;
+import java.net.InetSocketAddress;
 import java.net.SocketException;
 import java.net.UnknownHostException;
 import java.util.List;
@@ -36,7 +38,9 @@ public class GraphiteMetricsReporterService implements Service {
   private final List<String> _metricNames;
   private final int _reportIntervalSec;
   private final ScheduledExecutorService _executor;
-  private final GraphiteClient _graphiteClient;
+  private final InetAddress _remoteInetAddress;
+  private final int _port;
+  private final Graphite _graphiteClient;
   private final String _metricNamePrefix;
 
   public GraphiteMetricsReporterService(Map<String, Object> props, String name)
@@ -47,14 +51,18 @@ public class GraphiteMetricsReporterService implements Service {
     _reportIntervalSec = config.getInt(GraphiteMetricsReporterServiceConfig.REPORT_INTERVAL_SEC_CONFIG);
     _executor = Executors.newSingleThreadScheduledExecutor();
     _metricNamePrefix = config.getString(GraphiteMetricsReporterServiceConfig.REPORT_GRAPHITE_PREFIX);
-    _graphiteClient = GraphiteClientFactory.defaultGraphiteClient(
-        config.getString(GraphiteMetricsReporterServiceConfig.REPORT_GRAPHITE_HOST),
-        config.getInt(GraphiteMetricsReporterServiceConfig.REPORT_GRAPHITE_PORT));
+    
+    _remoteInetAddress = Inet4Address.getByName(
+      config.getString(GraphiteMetricsReporterServiceConfig.REPORT_GRAPHITE_HOST));
+    _port = config.getInt(GraphiteMetricsReporterServiceConfig.REPORT_GRAPHITE_PORT);
+    _graphiteClient = new Graphite(new InetSocketAddress(_remoteInetAddress, _port));
   }
 
   @Override
   public synchronized void start() {
-    _executor.scheduleAtFixedRate(
+    try {
+      _graphiteClient.connect();
+      _executor.scheduleAtFixedRate(
         new Runnable() {
           @Override
           public void run() {
@@ -65,8 +73,11 @@ public class GraphiteMetricsReporterService implements Service {
             }
           }
         }, _reportIntervalSec, _reportIntervalSec, TimeUnit.SECONDS
-    );
-    LOG.info("{}/GraphiteMetricsReporterService started", _name);
+      );
+      LOG.info("{}/GraphiteMetricsReporterService started", _name);
+    } catch (Exception error) {
+      LOG.error(_name + "/GraphiteMetricsReporterService failed to connect to graphite", error);
+    }
   }
 
   @Override
@@ -106,11 +117,14 @@ public class GraphiteMetricsReporterService implements Service {
       String attributeExpr = metricName.substring(metricName.lastIndexOf(":") + 1);
       List<MbeanAttributeValue> attributeValues = getMBeanAttributeValues(mbeanExpr, attributeExpr);
       for (MbeanAttributeValue attributeValue: attributeValues) {
-        _graphiteClient.saveCarbonMetrics(
-            new SimpleCarbonMetric(
-                generateGraphiteMetricName(attributeValue.mbean(), attributeValue.attribute()),
-                String.valueOf(attributeValue.value()),
-                epoch));
+        try {
+          _graphiteClient.send(
+            generateGraphiteMetricName(attributeValue.mbean(), attributeValue.attribute()),
+            String.valueOf(attributeValue.value()),
+            epoch);
+        } catch (IOException error) {
+          LOG.error(_name + "/GraphiteMetricsReporterService failed to send metric to graphite", error);
+        }
       }
     }
   }
